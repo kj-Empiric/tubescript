@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: tubescript
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: YOUTUBE_COOKIES
+        sync: false
