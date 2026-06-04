@@ -5,17 +5,22 @@ import type { Segment } from '@/types/transcript'
 interface AvailableLang { code: string; name: string; isAuto: boolean }
 interface CaptionTrack { baseUrl: string; languageCode: string; name?: { simpleText?: string }; kind?: string }
 
-// Strategy 1: YouTube Innertube API (Android client)
-// Works for most videos. Some datacenter IPs get LOGIN_REQUIRED from YouTube.
 const INNERTUBE_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false'
 const CLIENT_VER = '20.10.38'
 const ANDROID_UA = `com.google.android.youtube/${CLIENT_VER} (Linux; U; Android 14)`
-
-// Strategy 2: HTML scraping fallback
-// Sends CONSENT cookie to bypass YouTube's GDPR consent wall on datacenter IPs.
-// Looks like a real browser request — passes where Innertube is blocked.
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 const CONSENT_COOKIE = 'SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI4LjA3X3AwGgJlbiAC; CONSENT=YES+cb.20210328=1'
+
+// YouTube cookie auth: if YOUTUBE_COOKIES env var is set, all requests use the user's
+// authenticated session — bypasses LOGIN_REQUIRED for ALL videos from any IP.
+function getAuthCookies(): string {
+  const yt = process.env.YOUTUBE_COOKIES
+  // Merge user cookies with consent cookie so both auth + consent work
+  return yt ? `${CONSENT_COOKIE}; ${yt}` : CONSENT_COOKIE
+}
+function isAuthConfigured(): boolean {
+  return !!process.env.YOUTUBE_COOKIES
+}
 
 function buildLangList(tracks: CaptionTrack[]): AvailableLang[] {
   const seen = new Map<string, AvailableLang>()
@@ -78,8 +83,10 @@ function parseTracksFromHTML(html: string): CaptionTrack[] {
 
 async function fetchCaptionXML(baseUrl: string, ua: string): Promise<string | null> {
   try {
+    const headers: Record<string, string> = { 'User-Agent': ua }
+    if (isAuthConfigured()) headers['Cookie'] = getAuthCookies()
     const res = await fetch(baseUrl, {
-      headers: { 'User-Agent': ua },
+      headers,
       signal: AbortSignal.timeout(8000),
     })
     if (!res.ok) return null
@@ -88,11 +95,18 @@ async function fetchCaptionXML(baseUrl: string, ua: string): Promise<string | nu
   } catch { return null }
 }
 
-// --- Strategy 1: Innertube ---
+// --- Strategy 1: Innertube (with optional auth cookies) ---
 async function viaInnertube(videoId: string, lang?: string) {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'User-Agent': ANDROID_UA,
+  }
+  // When auth cookies present, include them — bypasses LOGIN_REQUIRED from datacenter IPs
+  if (isAuthConfigured()) headers['Cookie'] = getAuthCookies()
+
   const res = await fetch(INNERTUBE_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_UA },
+    headers,
     body: JSON.stringify({ videoId, context: { client: { clientName: 'ANDROID', clientVersion: CLIENT_VER } } }),
     signal: AbortSignal.timeout(10000),
   })
@@ -114,24 +128,18 @@ async function viaInnertube(videoId: string, lang?: string) {
   if (!segments.length) return null
 
   const vd = data?.videoDetails
-  return {
-    segments,
-    language: target.languageCode,
-    availableLanguages: buildLangList(tracks),
-    title: vd?.title,
-    channelName: vd?.author,
-  }
+  return { segments, language: target.languageCode, availableLanguages: buildLangList(tracks), title: vd?.title, channelName: vd?.author }
 }
 
-// --- Strategy 2: HTML scraping with consent cookie bypass ---
+// --- Strategy 2: HTML scraping (with auth cookies if available) ---
 async function viaHTMLScrape(videoId: string, lang?: string) {
   const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'en-US,en;q=0.9', 'Cookie': CONSENT_COOKIE },
+    headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'en-US,en;q=0.9', 'Cookie': getAuthCookies() },
     signal: AbortSignal.timeout(10000),
   })
   if (!pageRes.ok) return null
   const html = await pageRes.text()
-  if (html.includes('class="g-recaptcha"')) return null  // rate limited
+  if (html.includes('class="g-recaptcha"')) return null
 
   const tracks = parseTracksFromHTML(html)
   if (!tracks.length) return null
@@ -166,17 +174,18 @@ export async function POST(req: NextRequest) {
     if (!videoId)
       return NextResponse.json({ error: 'Invalid YouTube URL' }, { status: 400 })
 
-    // Run oEmbed and transcript fetch in parallel (oEmbed works from any IP)
+    // Run oEmbed and transcript fetch in parallel
     const [oEmbed, result] = await Promise.all([
       fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`, {
         signal: AbortSignal.timeout(5000),
       }).then((r) => r.ok ? r.json() : null).catch(() => null),
-      // Try Innertube first, fall back to HTML scraping
       viaInnertube(videoId, lang).then(async (r) => r ?? viaHTMLScrape(videoId, lang)),
     ])
 
     if (!result)
-      return NextResponse.json({ error: 'No captions available for this video' }, { status: 404 })
+      return NextResponse.json({
+        error: 'Transcript unavailable — this video may be region-locked or restricted from server access. Try a different video.',
+      }, { status: 404 })
 
     return NextResponse.json({
       videoId,
